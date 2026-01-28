@@ -1,0 +1,20 @@
+{
+  "C_Cpp.intelliSenseEngine": "default",
+  "idf.espIdfPath": "/Users/lucreveyron/esp/v5.5/esp-idf",
+  "idf.pythonInstallPath": "/opt/homebrew/bin/python3",
+  "idf.openOcdConfigs": [
+    "board/esp32-wrover-kit-3.3v.cfg"
+  ],
+  "idf.port": "/dev/tty.usbserial-210",
+  "idf.toolsPath": "/Users/lucreveyron/.espressif",
+  "idf.customExtraVars": {
+    "IDF_TARGET": "esp32"
+  },
+  "clangd.path": "/Users/lucreveyron/.espressif/tools/esp-clang/esp-19.1.2_20250312/esp-clang/bin/clangd",
+  "clangd.arguments": [
+    "--background-index",
+    "--query-driver=**",
+    "--compile-commands-dir=/Users/lucreveyron/KeWoRe/build"
+  ],
+  "idf.flashType": "UART"
+}
