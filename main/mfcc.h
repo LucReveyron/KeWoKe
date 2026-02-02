@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cmath>
 #include <algorithm>
+#include "freertos/semphr.h"
 
 #include "kissFFT/kiss_fftr.h"
 #include "hamming_window.hpp"
@@ -13,6 +14,57 @@ constexpr int16_t INT16_MIN_VALUE = -32768;
 constexpr int16_t ALPHA_Q15 = 31876; // 0.97 in Q15
 
 constexpr int16_t SAMPLE_FREQ = 16000;
+
+template <
+    typename T,
+    int ROW = NUM_FRAMES,
+    int COLUMN = NUMBER_CEPS
+>
+class shared_buffer
+{
+    private:
+    std::array<std::array<T, COLUMN>, ROW> buffer{};
+    SemaphoreHandle_t buffer_mutex;
+
+    public:
+        shared_buffer(){buffer_mutex = xSemaphoreCreateMutex();}
+        ~shared_buffer()
+        {
+            if (buffer_mutex != NULL) {
+                vSemaphoreDelete(buffer_mutex);  
+                buffer_mutex = NULL;  
+            }
+        }
+
+        void set_buffer(std::array<std::array<T, COLUMN>, ROW> input_buffer)
+        {
+            xSemaphoreTake(buffer_mutex, portMAX_DELAY);
+            buffer = input_buffer;
+            xSemaphoreGive(buffer_mutex);
+        }
+
+        void set_row(std::array<T, COLUMN> column, size_t index)
+        {
+            xSemaphoreTake(buffer_mutex, portMAX_DELAY);
+            buffer[index] = column;
+            xSemaphoreGive(buffer_mutex);
+        }
+
+        std::array<std::array<T, COLUMN>, ROW> get_buffer()
+        {
+            return buffer;
+        }
+
+        std::array<std::array<T, COLUMN>, ROW>& ref_buffer()
+        {
+            return buffer;
+        }
+
+        T get_element(size_t row, size_t column)
+        {
+            return buffer[row][column];
+        }
+};
 
 template <
     int FRAME_SIZE = 400,
@@ -32,6 +84,16 @@ public:
 
     MFCC();
     ~MFCC();
+
+    // Methods
+    void apply_pre_emphasis();
+    void apply_hamming_window();
+    void compute_FFT();
+    void compute_power_spectrum();
+    float from_mel_to_hz(float freq_mel);
+    void compute_triangle_filters();
+    void apply_mel_banks();
+    void compute_DCT(); 
 
     void set_signal(const std::array<int16_t, FRAME_SIZE>& new_signal);
     void compute_coefficient();
@@ -55,16 +117,6 @@ private:
 
     // MFC coefficients
     std::array<int16_t, NUMBER_CEPS> coef{};
-
-    // Methods
-    void apply_pre_emphasis();
-    void apply_hamming_window();
-    void compute_FFT();
-    void compute_power_spectrum();
-    float from_mel_to_hz(float freq_mel);
-    void compute_triangle_filters();
-    void apply_mel_banks();
-    void compute_DCT(); 
 };
 
 // PUBLIC METHODS

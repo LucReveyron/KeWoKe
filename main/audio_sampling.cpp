@@ -4,9 +4,12 @@
 #include "freertos/task.h"
 #include "driver/i2s_std.h"
 #include "driver/gpio.h"
+#include "esp_log.h"
 #include "esp_err.h"
 
 #include "audio_sampling.h"
+
+static const char* TAG = "Audio_sampling.cpp";
 
 i2s_chan_handle_t rx_handle = nullptr;
 
@@ -39,6 +42,8 @@ void i2s_install(void)
     i2s_channel_init_std_mode(rx_handle, &std_cfg);
 
     i2s_channel_enable(rx_handle);
+
+    ESP_LOGI(TAG, "I2S enable\n");
 }
 
 size_t i2s_read_samples(int16_t *buffer, size_t len)
