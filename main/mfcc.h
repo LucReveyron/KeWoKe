@@ -36,7 +36,7 @@ class shared_buffer
             }
         }
 
-        void set_buffer(std::array<std::array<T, COLUMN>, ROW> input_buffer)
+        void set_buffer(std::array<std::array<T, COLUMN>, ROW>& input_buffer)
         {
             xSemaphoreTake(buffer_mutex, portMAX_DELAY);
             buffer = input_buffer;
