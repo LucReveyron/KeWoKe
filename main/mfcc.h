@@ -15,63 +15,25 @@ constexpr int16_t ALPHA_Q15 = 31876; // 0.97 in Q15
 
 constexpr int16_t SAMPLE_FREQ = 16000;
 
-template <
-    typename T,
-    int ROW = NUM_FRAMES,
-    int COLUMN = NUMBER_CEPS
->
+template<typename T, int ROW = 50, int COLUMN = 40>
 class shared_buffer
 {
-    private:
-    std::array<std::array<T, COLUMN>, ROW> buffer{};
-    SemaphoreHandle_t buffer_mutex;
+private:
+    std::array<std::array<T, COLUMN>, ROW> buffer;
 
-    public:
-        shared_buffer(){buffer_mutex = xSemaphoreCreateMutex();}
-        ~shared_buffer()
-        {
-            if (buffer_mutex != NULL) {
-                vSemaphoreDelete(buffer_mutex);  
-                buffer_mutex = NULL;  
-            }
-        }
-
-        void set_buffer(std::array<std::array<T, COLUMN>, ROW>& input_buffer)
-        {
-            xSemaphoreTake(buffer_mutex, portMAX_DELAY);
-            buffer = input_buffer;
-            xSemaphoreGive(buffer_mutex);
-        }
-
-        void set_row(std::array<T, COLUMN> column, size_t index)
-        {
-            xSemaphoreTake(buffer_mutex, portMAX_DELAY);
-            buffer[index] = column;
-            xSemaphoreGive(buffer_mutex);
-        }
-
-        std::array<std::array<T, COLUMN>, ROW> get_buffer()
-        {
-            return buffer;
-        }
-
-        std::array<std::array<T, COLUMN>, ROW>& ref_buffer()
-        {
-            return buffer;
-        }
-
-        T get_element(size_t row, size_t column)
-        {
-            return buffer[row][column];
-        }
+public:
+    std::array<std::array<T, COLUMN>, ROW>& data()
+    {
+        return buffer;
+    }
 };
 
 template <
-    int FRAME_SIZE = 400,
-    int FRAME_STRIDE = 160,
+    int FRAME_SIZE = 480,
+    int FRAME_STRIDE = 320,
     int NUMBER_FILTERS = 40,
     int NFFT = 512,
-    int NUMBER_CEPS = 13
+    int NUMBER_CEPS = 40
 >
 class MFCC
 {
@@ -243,7 +205,8 @@ void MFCC<F,ST,NF,NFFT, NCEPS>::compute_triangle_filters()
 template <int F, int ST, int NF, int NFFT, int NCEPS>
 void MFCC<F,ST,NF,NFFT, NCEPS>::apply_mel_banks()
 {
-    constexpr float LOG_SCALE = 1.0f; // adjust for dynamic range
+    constexpr float LOG_FLOOR = 1e-7f;
+    constexpr float LOG_SCALE = 256.0f; // Q8
 
     for(size_t filter = 0; filter < NF; filter++)
     {
@@ -251,17 +214,17 @@ void MFCC<F,ST,NF,NFFT, NCEPS>::apply_mel_banks()
 
         for(int s = 0; s < NFFT/2 + 1; s++)
         {
-            acc += power_spectrum[s] * mel_weights[filter][s];
+            acc += int64_t(power_spectrum[s]) * 
+                        int64_t(mel_weights[filter][s]);
         }
-        // Example: log compression
-        //float db = 20 * log10f(std::max((float)acc, 1.0f)); 
-        // Convert to float energy
-        float energy = acc * (1.0f / 32768.0f);
+        // Q15 → float
+        float energy = acc / (32768.0f * 32768.0f);
 
-        // Log compression
-        float log_energy = logf(std::max(energy, 1e-6f));
+        float log_energy = logf(std::max(energy, LOG_FLOOR));
 
-        filter_banks[filter] = (int16_t)(log_energy * LOG_SCALE);
+        int32_t q = int32_t(log_energy * LOG_SCALE);
+
+        filter_banks[filter] = int16_t(std::clamp(q, int32_t(-32768), int32_t(32767)));
     }
 }
 

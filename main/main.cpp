@@ -9,24 +9,26 @@
 #include "esp_task_wdt.h"  // Required for Task Watchdog Timer functions
 #include "esp_heap_caps.h"
 
+#include "ring_buffer.hpp"
 #include "audio_sampling.h"
+#include "audio_recognition.hpp"
 #include "mfcc.h"
 #include "ring_buffer.hpp"
 #include "mfcc_constants.hpp"
-#include "normalize.h"
-#include "model_functions.hpp"
 
 #define LOG_LOCAL_LEVEL ESP_LOG_VERBOSE
 
 static const char* TAG = "Main.cpp";
 
-// Global buffers / semaphores
-RingBuffer<int16_t, 4*FRAME_STRIDE, FRAME_SIZE, FRAME_STRIDE> ring_buffer;
-shared_buffer<int16_t> ping_coef;
-shared_buffer<int16_t> pong_coef;
+// Ping/Pong buffers
+shared_buffer<int16_t> bufferA;
+shared_buffer<int16_t> bufferB;
 
-SemaphoreHandle_t normalize_sem;
-SemaphoreHandle_t index_mutex = xSemaphoreCreateMutex();
+shared_buffer<int16_t>* write_buffer = &bufferA;
+shared_buffer<int16_t>* read_buffer  = &bufferB;
+
+TaskHandle_t inference_handle = nullptr;
+SemaphoreHandle_t normalize_sem = nullptr;
 
 static MFCC<> mfccProcessor;
 size_t index_coef;
@@ -43,60 +45,27 @@ enum class MfccStage {
 };
 
 // Task prototypes
-void audio_task(void* arg);
 void mfcc_task(void* arg);
-void normalize_task(void* arg);
+void inference_task(void* arg);
 
 extern "C" void app_main(void)
 {
     ESP_LOGI(TAG, "Initialization ...\n");
+
+    normalize_sem = xSemaphoreCreateBinary();
+
     // Set up I2S
     i2s_install();
+    setup_recognition();
 
-    // Create semaphore for signaling normalize task
-    normalize_sem = xSemaphoreCreateBinary();
-    index_coef = 0;
-
-    model_setup();
-
-    // Create FreeRTOS tasks
-    // Pin Audio and MFCC to CPU 1 (Keep them together for fast data transfer)
-    xTaskCreatePinnedToCore(audio_task, "AudioTask", 8192, NULL, 5, NULL, 1);
-    xTaskCreatePinnedToCore(mfcc_task, "MFCCtask", 6144, NULL, 4, NULL, 1);
-
-    // We give it a priority of 1 so it yields to system background tasks.
-    xTaskCreate(normalize_task, "NormalizeTask", 1024 * 12, NULL, 1, NULL);
-
-    // IMPORTANT: De-register app_main from WDT before finishing
-    esp_task_wdt_delete(NULL);
+    xTaskCreatePinnedToCore(mfcc_task, "MFCCtask", 6144, NULL, 4, &task_handle, 1);
+    xTaskCreate(inference_task, "InferenceTask", 1024 * 12, NULL, 1, &inference_handle);
 
     ESP_LOGI(TAG, "Initialization End\n");
 }
 
 // ------------------ TASK STRUCTURE ------------------
 
-// Task 1: Audio acquisition
-void audio_task(void* arg)
-{
-    ESP_LOGI(TAG, "Audio task\n");
-    std::array<int16_t, FRAME_STRIDE> signal{};
-    static int16_t buffer[BUFFER_LEN];
-
-    for(;;)
-    {
-        // Read audio samples from I2S and push to ring buffer
-        size_t len_samples = i2s_read_samples(buffer, BUFFER_LEN);
-
-        for (size_t i = 0; i < len_samples; i++) {
-
-            signal[i] = buffer[i];
-        }
-
-        ring_buffer.update_buffer(signal);
-
-        vTaskDelay(pdMS_TO_TICKS(1)); // yield
-    }
-}
 
 // Task 2: MFCC computation
 void mfcc_task(void* arg)
@@ -109,18 +78,38 @@ void mfcc_task(void* arg)
         switch (stage)
         {
             case MfccStage::IDLE:
-                xSemaphoreTake(index_mutex, portMAX_DELAY);
-                if (index_coef < NUM_FRAMES)
+                // Wait for notification from the I2S ISR callback
+                ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+                std::array<int16_t, FRAME_SIZE> frame;
+
+                if (ring_buffer.read_samples(frame.data())) 
                 {
-                    xSemaphoreGive(index_mutex);
-                    mfccProcessor.set_signal(ring_buffer.get_samples());
+
+                    /*
+                    // Find max absolute sample
+                    int16_t max_val = 0;
+                    for(int i = 0; i < FRAME_SIZE; i++) {
+                        if(abs(frame[i]) > max_val) max_val = abs(frame[i]);
+                    }
+
+                    // Avoid division by zero
+                    float norm_factor = (max_val == 0) ? 1.0f : 32767.0f / max_val;
+
+                    // Apply normalization safely
+                    for(int i = 0; i < FRAME_SIZE; i++) {
+                        float tmp = frame[i] * norm_factor;
+                        if(tmp > 32767.0f) tmp = 32767.0f;
+                        if(tmp < -32768.0f) tmp = -32768.0f;
+                        frame[i] = static_cast<int16_t>(tmp);
+                    }*/
+                    
+                    mfccProcessor.set_signal(frame);
                     stage = MfccStage::PRE_EMPHASIS;
-                }
+                } 
                 else 
                 {
-                    xSemaphoreGive(index_mutex);
-                    // We are waiting for normalize_task to reset index_coef
-                    vTaskDelay(pdMS_TO_TICKS(10)); 
+                    // Wait for more data
+                    vTaskDelay(pdMS_TO_TICKS(1));
                 }
                 break;
 
@@ -155,16 +144,24 @@ void mfcc_task(void* arg)
                 break;
 
             case MfccStage::STORE:
-                xSemaphoreTake(index_mutex, portMAX_DELAY);
-                ping_coef.set_row(mfccProcessor.get_coefficient(), index_coef);
+                write_buffer->data()[index_coef] = mfccProcessor.get_coefficient();
                 index_coef++;
                 
                 if (index_coef == NUM_FRAMES)
                 {
                     ESP_LOGD(TAG, "Buffer Full! Triggering Model...");
-                    xSemaphoreGive(normalize_sem);
+                    auto temp = write_buffer;
+                    write_buffer = read_buffer;
+                    read_buffer = temp;
+
+                    index_coef = 0;
+
+                    xTaskNotify(inference_handle, 0, eNoAction);
                 }
-                xSemaphoreGive(index_mutex);
+
+                //if(index_coef % 10 == 0)
+                    //xTaskNotify(inference_handle, 0, eNoAction);
+
                 stage = MfccStage::IDLE;
                 break;
         }
@@ -174,25 +171,16 @@ void mfcc_task(void* arg)
     }
 }
 
-// Task 3: Normalize and plot
-void normalize_task(void* arg)
+void inference_task(void* arg)
 {
-    ESP_LOGI(TAG, "Norm task\n");
+    ESP_LOGD(TAG, "Inference task\n");
 
     for(;;)
-    {
-        if(xSemaphoreTake(normalize_sem, portMAX_DELAY) == pdTRUE)
-        {
-            //QUICKLY copy/swap data and reset the index
-            xSemaphoreTake(index_mutex, portMAX_DELAY);
-            pong_coef.set_buffer(ping_coef.ref_buffer()); // Transfer data to "Pong"
-            index_coef = 0;                               // Reset "Ping" index immediately
-            xSemaphoreGive(index_mutex);
-
-            // Run inference
-            model_loop(pong_coef.ref_buffer());
+    {   
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        // Run inference
+        run_inference(read_buffer->data());
             
-            ESP_LOGI(TAG, "Model Done. Ready for new audio.");
-        }
+        //ESP_LOGI(TAG, "Model Done. Ready for new audio.");
     }
 }

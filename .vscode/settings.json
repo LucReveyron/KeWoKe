@@ -16,5 +16,6 @@
     "--query-driver=**",
     "--compile-commands-dir=/Users/lucreveyron/KeWoRe/build"
   ],
-  "idf.flashType": "UART"
+  "idf.flashType": "UART",
+  "idf.currentSetup": "/Users/lucreveyron/esp/v5.5/esp-idf"
 }
